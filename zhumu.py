@@ -26,7 +26,12 @@ from tkinter import messagebox
 
 import numpy as np
 import aiohttp
+import warnings
 import soundcard as sc
+
+# soundcard 的 MediaFoundation 后端在 Windows 上偶发「data discontinuity」，
+# 是缓冲区瞬时不同步的无害警告，音频流本身是通的，抑制掉免得刷屏
+warnings.filterwarnings("ignore", message=".*data discontinuity.*")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONF_PATH = os.path.join(APP_DIR, "config.json")
@@ -1533,10 +1538,14 @@ class App:
         parts = [x.strip() for x in re.split(r"(?<=[。！？!?])", raw) if x.strip()]
         if not parts:
             return
-        # 只显示已经有译文的句子。没翻译完的句子不能拿原文顶替，
-        # 否则关掉双语也会看到日文漏出来。
-        shown = [self.tr_cache[x] for x in parts if x in self.tr_cache]
-        self.sub.set_stream_text("".join(shown))
+        if mostly_chinese(raw):
+            # 中文直接转写显示，不经过翻译缓存
+            self.sub.set_stream_text(raw)
+        else:
+            # 外语只显示已经有译文的句子。没翻译完的句子不能拿原文顶替，
+            # 否则关掉双语也会看到日文漏出来。
+            shown = [self.tr_cache[x] for x in parts if x in self.tr_cache]
+            self.sub.set_stream_text("".join(shown))
 
         # 原文只在「开着双语」且不是中文时才喂进去
         if self.conf.get("show_source") and not mostly_chinese(raw):
