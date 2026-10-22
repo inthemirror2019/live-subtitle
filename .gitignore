@@ -1,0 +1,23 @@
+# ---- 隐私：绝对不要提交 ----
+.env
+config.json
+
+# ---- 运行时产物 ----
+session.log
+error.log
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 工作区内部数据 ----
+.workbuddy/
+
+# ---- 已废弃的原型 / 一次性脚本 ----
+index.html
+字幕实验台.html
+测百炼.py
+测全链路.py
+测首字延迟.py
+测上下文效果.py
+测音频.py
+测增益.py

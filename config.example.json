@@ -1,0 +1,20 @@
+{
+  "keys": [{"name": "默认", "key": "sk-请填入你的阿里百炼APIKey"}],
+  "active": 0,
+  "rate": 1,
+  "preset": "outline",
+  "bg_mode": "transparent",
+  "alpha": 0.85,
+  "x": 200,
+  "y": 760,
+  "w": 1000,
+  "h": 200,
+  "ratio": 0.15,
+  "auto_width": false,
+  "show_sub": true,
+  "audio_device": "",
+  "show_source": false,
+  "src_lang": "auto",
+  "dst_lang": "zh",
+  "idle_hide": 5.0
+}
