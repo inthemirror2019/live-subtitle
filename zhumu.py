@@ -388,27 +388,33 @@ active_key_holder = {"k": ""}
 
 
 def split_units(text):
-    """把长句切成「翻译单元」：句末标点 > 逗号 > 约 12 字兜底。
-    让长句能分块翻译、分行陆续显示，不必等整句翻完才出字。"""
+    """把长句切成「翻译单元」。
+
+    切分优先级（高→低）：
+      1. 语音停顿（\\u0001 标记，相邻词间隔 > 400ms）
+      2. 标点（句末 。！？!? 与逗号类 ，、,;；）—— 标点处必切，不再累积
+      3. 12 字兜底（只用于完全没有标点的长段）
+    标点切出来的短句不合并（它们是完整语义单元）。
+    """
     if not text:
         return []
     out = []
-    # 最高优先：语音停顿处切（说话人顿一下就是句边界）
+    # 1) 先按语音停顿切
     for seg in [x.strip() for x in text.split("\u0001") if x.strip()]:
-        for big in [x.strip() for x in re.split(r"(?<=[。！？!?])", seg) if x.strip()]:
-            cur = ""
-            for piece in [x.strip() for x in re.split(r"(?<=[，、,;；])", big) if x.strip()]:
-                if cur and len(cur) + len(piece) > 12:
-                    out.append(cur)
-                    cur = piece
-                else:
-                    cur += piece
-            if cur:
-                out.append(cur)
-    # 过短的块合并到下一块，避免切出一两个字的碎片
+        # 2) 再按标点切 —— 标点处必切（优先级高于字数兜底）
+        for p in [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", seg) if x.strip()]:
+            # 3) 只有「没有标点结尾的长段」才按 12 字兜底
+            while len(p) > 12 and not p.rstrip().endswith(tuple("。！？!?，、,;；")):
+                out.append(p[:12])
+                p = p[12:]
+            if p:
+                out.append(p)
+    # 过短块合并：<4 字且不以标点结尾的碎片才合并（标点结尾的是完整短句）
     merged = []
     for u in out:
-        if merged and len(merged[-1]) < 4:
+        prev_ok = (merged and len(merged[-1]) < 4
+                   and not merged[-1].rstrip().endswith(tuple("。！？!?，、,;；")))
+        if prev_ok:
             merged[-1] += u
         else:
             merged.append(u)
