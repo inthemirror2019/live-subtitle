@@ -525,8 +525,9 @@ class SubtitleWindow:
         self.show_source = conf.get("show_source", False)
         self._last_active_at = 0.0   # 最后一次收到新内容的时间
         self._line_shown_at = 0.0    # 当前这行是什么时候开始显示的
-        self._pending_text = None    # 还没到最短显示时间，暂存的新内容
+        self._pending_q = []         # 还没到最短显示时间，排队的新内容（FIFO，不丢）
         self._pending_job = None
+        self._flushing = False
         self.latency = None
         self.state = "idle"
 
@@ -838,8 +839,13 @@ class SubtitleWindow:
             # 一两个字的碎片不单独成行，攒着合并到下一行
             merged, pending = [], []
             for x in parts:
-                if len(x.strip()) < 3:
-                    pending.append(x.strip())
+                xs = x.strip()
+                # 一两个字但以标点结尾的是完整短句（「是。」「好，」），要显示；
+                # 没标点的短碎片（「那么」）才攒着合并到下一行。
+                # 否则短句全被吞掉，会连续跳过好几句。
+                ends_punct = bool(xs) and xs[-1] in "。！？!?，、,;；"
+                if len(xs) < 3 and not ends_punct:
+                    pending.append(xs)
                 else:
                     if pending:
                         merged.append("".join(pending) + x)
@@ -888,17 +894,18 @@ class SubtitleWindow:
                 min_show = max(1.2, base_min * 0.7)    # 较密集
             else:
                 min_show = base_min                    # 正常节奏
-            if min_show > 0 and self._line_shown_at:
+            # 短句读得快，显示时间更短，别让它排长队
+            if len(text.strip()) < 6:
+                min_show = max(0.5, min_show * 0.45)
+            if (not self._flushing and min_show > 0 and self._line_shown_at):
                 elapsed = now - self._line_shown_at
                 if 0 <= elapsed < min_show:
-                    self._pending_text = text
-                    if self._pending_job:
-                        try:
-                            self.win.after_cancel(self._pending_job)
-                        except Exception:
-                            pass
-                    self._pending_job = self.win.after(
-                        int((min_show - elapsed) * 1000) + 40, self._flush_pending)
+                    # 排队而不是覆盖：连续短句不会被跳过
+                    self._pending_q.append(text)
+                    if not self._pending_job:
+                        self._pending_job = self.win.after(
+                            int((min_show - elapsed) * 1000) + 40,
+                            self._flush_pending)
                     return
 
             parts = refine(split_seg(text))
@@ -923,12 +930,18 @@ class SubtitleWindow:
         self.redraw()
 
     def _flush_pending(self):
-        """最短显示时间到了，把攒着的新内容放出来"""
+        """最短显示时间到了，把排队的新内容按顺序放出来（不跳过）"""
         self._pending_job = None
-        if self._pending_text:
-            t = self._pending_text
-            self._pending_text = None
-            self.set_stream_text(t)
+        if self._pending_q:
+            t = self._pending_q.pop(0)
+            self._flushing = True
+            try:
+                self.set_stream_text(t)
+            finally:
+                self._flushing = False
+            # 队列还有就继续，每条间隔短一点
+            if self._pending_q:
+                self._pending_job = self.win.after(220, self._flush_pending)
 
     def finalize(self):
         """一句结束：把它变成固定行，等下一句"""
