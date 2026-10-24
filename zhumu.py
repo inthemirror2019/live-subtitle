@@ -826,7 +826,8 @@ class SubtitleWindow:
                 chunk = chunk.strip()
                 if not chunk:
                     continue
-                segs.extend([x.strip() for x in re.split(r"(?<=[。！？!?])", chunk)
+                # 句末标点 + 逗号类都分段：逗号处也断开，避免堆成一大段
+                segs.extend([x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", chunk)
                              if x.strip()])
             return segs
 
@@ -875,9 +876,18 @@ class SubtitleWindow:
             # 新内容（换句了）—— 上一行还没看够的话先攒着，别急着顶掉
             now = time.time()
             try:
-                min_show = float(self.conf.get("min_show", 2.5))
+                base_min = float(self.conf.get("min_show", 2.5))
             except Exception:
-                min_show = 2.5
+                base_min = 2.5
+            # 说话密集时加快刷新：换句间隔越短，最短显示时长越小，
+            # 否则密集时会攒一堆、然后一下子冒出来，看着累
+            gap = (now - self._line_shown_at) if self._line_shown_at else 999.0
+            if gap < 2.0:
+                min_show = max(0.8, base_min * 0.4)    # 很密集，快速刷
+            elif gap < 3.5:
+                min_show = max(1.2, base_min * 0.7)    # 较密集
+            else:
+                min_show = base_min                    # 正常节奏
             if min_show > 0 and self._line_shown_at:
                 elapsed = now - self._line_shown_at
                 if 0 <= elapsed < min_show:
