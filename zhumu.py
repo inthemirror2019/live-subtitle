@@ -125,6 +125,7 @@ DEFAULT_CONF = {
     "auto_width": False,
     "idle_hide": 5.0,
     "min_show": 2.5,
+    "punct_batch": True,
     "audio_device": "",
     "show_source": False,
     "src_lang": "auto",
@@ -868,16 +869,37 @@ class SubtitleWindow:
         prev_text = getattr(self, "_prev_text", "") or ""
 
         if prev_text and text.startswith(prev_text) and len(text) > len(prev_text):
-            # 同一句在增长：
-            #   已显示过的 → 上一行（lines）
-            #   新增的     → 最新行（active），合并成一行，绝不进上一行
-            shown = refine(split_seg(prev_text))
-            self.lines = shown[-2:]
+            # ═══════════════════════════════════════════════════════════
+            # 【改进实验 · 可回退】以断句为准，整段一次性显示
+            #   原行为：新增内容实时追加（打字机，一个字一个字蹦，看着累）
+            #   新行为：累积到断句点（标点结尾）才一次性显示完整片段
+            #   回退方法：把下面「if not complete: return」改成直接显示 new_txt
+            # ═══════════════════════════════════════════════════════════
             new_txt = text[len(prev_text):].strip()
             new_txt = " ".join(x for x in new_txt.split("\n") if x.strip())
-            # 新增部分若是纯标点/空，保持原来的 active 不动
-            if re.sub(r"[。！？!?，、,;；\s]", "", new_txt):
-                self.active = new_txt
+
+            if self.conf.get("punct_batch", True):
+                # 【按断句整段显示】累积到断句点才一次性出完整片段，
+                # 不再一个字一个字蹦。可在设置里关掉（关掉=打字机模式）
+                segs = [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", new_txt)
+                        if x.strip()]
+                complete = [x for x in segs
+                            if x and x[-1] in "。！？!?，、,;；"
+                            and re.sub(r"[。！？!?，、,;；\s]", "", x)]
+                if not complete:
+                    # 还没到断句点 → 不显示，继续累积
+                    return
+                shown = refine(split_seg(prev_text))
+                self.lines = shown[-2:]
+                if len(complete) > 1:
+                    self.lines = (self.lines + complete[:-1])[-2:]
+                self.active = complete[-1]
+            else:
+                # 【打字机模式】新增内容实时追加
+                shown = refine(split_seg(prev_text))
+                self.lines = shown[-2:]
+                if re.sub(r"[。！？!?，、,;；\s]", "", new_txt):
+                    self.active = new_txt
         else:
             # 新内容（换句了）—— 上一行还没看够的话先攒着，别急着顶掉
             now = time.time()
@@ -1297,6 +1319,16 @@ class Settings:
                        activeforeground=TXT, font=(FONT, 10), bd=0,
                        highlightthickness=0).pack(side="left")
 
+        r6b = tk.Frame(c2, bg=CARD)
+        r6b.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(r6b, text="", bg=CARD, width=6).pack(side="left")
+        self.punct_batch_var = tk.BooleanVar(value=conf.get("punct_batch", True))
+        tk.Checkbutton(r6b, text="按断句整段显示（关=打字机）", variable=self.punct_batch_var,
+                       command=self._on_punct_batch, bg=CARD, fg=TXT2,
+                       selectcolor=CARD2, activebackground=CARD,
+                       activeforeground=TXT, font=(FONT, 10), bd=0,
+                       highlightthickness=0).pack(side="left")
+
         # ---- 状态卡片 ----
         c3 = card(root, "状态")
         rdev = tk.Frame(c3, bg=CARD)
@@ -1477,6 +1509,10 @@ class Settings:
     def _on_dst_lang(self, name):
         code = dict((n, c) for c, n in DST_LANGS).get(name, "zh")
         self.conf["dst_lang"] = code
+        save_conf(self.conf)
+
+    def _on_punct_batch(self):
+        self.conf["punct_batch"] = bool(self.punct_batch_var.get())
         save_conf(self.conf)
 
     def _on_show_source(self):
