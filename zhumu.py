@@ -40,16 +40,16 @@ LOG_PATH = os.path.join(APP_DIR, "session.log")
 SR = 16000
 ASR_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 ASR_WS = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
-ASR_MODEL = "paraformer-realtime-v2"
+ASR_MODEL = "fun-asr-realtime"  # 30 语种+16 方言，比 paraformer 新、延迟更低（实测 0.55s）
 MT_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
 FONT = "Microsoft YaHei"
 
 # 语言码：界面中文名 -> ASR 提示码 / 翻译目标名
-# 识别引擎（paraformer-realtime-v2）实测只支持这几种，
-# 西班牙语/葡萄牙语/意大利语实测输出乱码，所以不放进源语言
+# fun-asr-realtime 支持 30 语种 + 16 方言；es/pt/it 已实测可用（paraformer 不行）
 SRC_LANGS = [("auto", "自动"), ("zh", "中文"), ("en", "英语"), ("ja", "日语"),
-             ("ko", "韩语"), ("ru", "俄语"), ("fr", "法语"), ("de", "德语")]
+             ("ko", "韩语"), ("ru", "俄语"), ("fr", "法语"), ("de", "德语"),
+             ("es", "西班牙语"), ("pt", "葡萄牙语"), ("it", "意大利语")]
 # 目标语言可以比源语言多：翻译模型支持 92 种，识别不支持也能翻过去
 DST_LANGS = [("zh", "中文"), ("en", "英语"), ("ja", "日语"), ("ko", "韩语"),
              ("ru", "俄语"), ("fr", "法语"), ("de", "德语"),
@@ -124,6 +124,7 @@ DEFAULT_CONF = {
     "ratio": 0.16,
     "auto_width": False,
     "idle_hide": 5.0,
+    "min_show": 2.5,
     "audio_device": "",
     "show_source": False,
     "src_lang": "auto",
@@ -348,6 +349,23 @@ class AsrStream(threading.Thread):
                     text = (sent.get("text") or "").strip()
                     if not text:
                         continue
+                    # 用词级时间戳找语音停顿（相邻词间隔 > 400ms），
+                    # 在停顿处插切分标记 \u0001 —— 说话人「顿一下」就是天然句边界
+                    words = sent.get("words") or []
+                    if words:
+                        marked = []
+                        for wi, w in enumerate(words):
+                            if wi > 0:
+                                pe = words[wi - 1].get("end_time")
+                                cb = w.get("begin_time")
+                                if (pe is not None and cb is not None
+                                        and cb - pe > 400):
+                                    marked.append("\u0001")
+                            marked.append((w.get("text") or "") +
+                                          (w.get("punctuation") or ""))
+                        text = "".join(marked).strip("\u0001")
+                        if not text:
+                            continue
                     begin = sent.get("begin_time")
                     if cur_begin is None:
                         cur_begin = begin
@@ -366,6 +384,34 @@ class AsrStream(threading.Thread):
 
 
 active_key_holder = {"k": ""}
+
+
+def split_units(text):
+    """把长句切成「翻译单元」：句末标点 > 逗号 > 约 12 字兜底。
+    让长句能分块翻译、分行陆续显示，不必等整句翻完才出字。"""
+    if not text:
+        return []
+    out = []
+    # 最高优先：语音停顿处切（说话人顿一下就是句边界）
+    for seg in [x.strip() for x in text.split("\u0001") if x.strip()]:
+        for big in [x.strip() for x in re.split(r"(?<=[。！？!?])", seg) if x.strip()]:
+            cur = ""
+            for piece in [x.strip() for x in re.split(r"(?<=[，、,;；])", big) if x.strip()]:
+                if cur and len(cur) + len(piece) > 12:
+                    out.append(cur)
+                    cur = piece
+                else:
+                    cur += piece
+            if cur:
+                out.append(cur)
+    # 过短的块合并到下一块，避免切出一两个字的碎片
+    merged = []
+    for u in out:
+        if merged and len(merged[-1]) < 4:
+            merged[-1] += u
+        else:
+            merged.append(u)
+    return merged
 
 
 def list_loopback_devices():
@@ -472,12 +518,15 @@ class SubtitleWindow:
         self.canvas.pack(fill="both", expand=True)
 
         self.src_text = ""
-        self.dst_text = "正在听…"
+        self.dst_text = "…"
         self.lines = []       # 已完成的句子（最多保留 2 条）
         self.active = ""      # 正在增长的那一句
         self.src_line = ""    # 当前句的原文（可选显示）
         self.show_source = conf.get("show_source", False)
         self._last_active_at = 0.0   # 最后一次收到新内容的时间
+        self._line_shown_at = 0.0    # 当前这行是什么时候开始显示的
+        self._pending_text = None    # 还没到最短显示时间，暂存的新内容
+        self._pending_job = None
         self.latency = None
         self.state = "idle"
 
@@ -763,18 +812,113 @@ class SubtitleWindow:
         self._fit_width()
 
     def set_stream_text(self, text):
-        """流式累积文本 → 上面的行固定、最后一行实时增长"""
-        parts = [x.strip() for x in re.split(r"(?<=[。！？!?])", text) if x.strip()]
-        if not parts:
-            return
-        if len(parts) > 1:
-            self.lines = parts[:-1][-2:]
-        self.active = parts[-1]
+        """流式累积文本 → 上面的行固定、最后一行实时增长
+
+        关键约束：**上一行只能是「已经显示过」的内容**，
+        没显示过的一律放最新行，新旧绝不能混在一行里。
+        """
+        raw_text = text
+
+        def split_seg(t):
+            segs = []
+            # 停顿标记也是切分边界
+            for chunk in t.replace("\u0001", "\n").split("\n"):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                segs.extend([x.strip() for x in re.split(r"(?<=[。！？!?])", chunk)
+                             if x.strip()])
+            return segs
+
+        def refine(parts):
+            # 纯标点的片段直接丢掉（如单独一个「。」「，」），它不是内容
+            parts = [x for x in parts
+                     if re.sub(r"[。！？!?，、,;；\s]", "", x)]
+            # 一两个字的碎片不单独成行，攒着合并到下一行
+            merged, pending = [], []
+            for x in parts:
+                if len(x.strip()) < 3:
+                    pending.append(x.strip())
+                else:
+                    if pending:
+                        merged.append("".join(pending) + x)
+                        pending = []
+                    else:
+                        merged.append(x)
+            if pending:
+                merged.append("".join(pending))
+            # 长句按字数断行换下一行
+            MAXL = 20
+            out = []
+            for pp in merged:
+                while len(pp) > MAXL:
+                    out.append(pp[:MAXL])
+                    pp = pp[MAXL:]
+                if pp:
+                    out.append(pp)
+            return out
+
+        prev_text = getattr(self, "_prev_text", "") or ""
+
+        if prev_text and text.startswith(prev_text) and len(text) > len(prev_text):
+            # 同一句在增长：
+            #   已显示过的 → 上一行（lines）
+            #   新增的     → 最新行（active），合并成一行，绝不进上一行
+            shown = refine(split_seg(prev_text))
+            self.lines = shown[-2:]
+            new_txt = text[len(prev_text):].strip()
+            new_txt = " ".join(x for x in new_txt.split("\n") if x.strip())
+            # 新增部分若是纯标点/空，保持原来的 active 不动
+            if re.sub(r"[。！？!?，、,;；\s]", "", new_txt):
+                self.active = new_txt
+        else:
+            # 新内容（换句了）—— 上一行还没看够的话先攒着，别急着顶掉
+            now = time.time()
+            try:
+                min_show = float(self.conf.get("min_show", 2.5))
+            except Exception:
+                min_show = 2.5
+            if min_show > 0 and self._line_shown_at:
+                elapsed = now - self._line_shown_at
+                if 0 <= elapsed < min_show:
+                    self._pending_text = text
+                    if self._pending_job:
+                        try:
+                            self.win.after_cancel(self._pending_job)
+                        except Exception:
+                            pass
+                    self._pending_job = self.win.after(
+                        int((min_show - elapsed) * 1000) + 40, self._flush_pending)
+                    return
+
+            parts = refine(split_seg(text))
+            if not parts:
+                # 全是标点/空，没有有效内容 → 保持当前显示，别清空
+                self._prev_text = raw_text
+                return
+            if len(parts) > 1:
+                self.lines = parts[:-1][-2:]
+            self.active = parts[-1]
+            self._line_shown_at = now
+
+        # 去重：上一行和本行不能一样
+        if self.active and self.lines and self.lines[-1] == self.active:
+            self.lines = self.lines[:-1]
+
         self.dst_text = self.active
         self.state = "live"
         self._last_active_at = time.time()
-        self._ensure_width_now()      # 先调宽再画，避免折行抖动
+        self._ensure_width_now()
+        self._prev_text = raw_text
         self.redraw()
+
+    def _flush_pending(self):
+        """最短显示时间到了，把攒着的新内容放出来"""
+        self._pending_job = None
+        if self._pending_text:
+            t = self._pending_text
+            self._pending_text = None
+            self.set_stream_text(t)
 
     def finalize(self):
         """一句结束：把它变成固定行，等下一句"""
@@ -1116,7 +1260,7 @@ class Settings:
                           activeforeground=TXT, font=(FONT, 10), bd=0)
         m2.pack(side="left")
 
-        tk.Label(c2, text="识别支持：中 英 日 韩 俄 法 德（其余语种可作翻译目标）",
+        tk.Label(c2, text="识别支持 30 语种：中 英 日 韩 俄 法 德 西 葡 意 等",
                  bg=CARD, fg=TXT3, font=(FONT, 8), anchor="w").pack(
             fill="x", padx=12, pady=(0, 4))
 
@@ -1452,7 +1596,7 @@ class App:
 
         self.sub.show()
         self.sub.set_state("live")
-        self.sub.dst_text = "正在听…"
+        self.sub.dst_text = "…"
         self.sub.redraw()
         self.settings._refresh_sub_btn()
         self.running = True
@@ -1535,17 +1679,32 @@ class App:
         raw = self._last_raw
         if not raw:
             return
-        parts = [x.strip() for x in re.split(r"(?<=[。！？!?])", raw) if x.strip()]
+        parts = split_units(raw)
         if not parts:
             return
         if mostly_chinese(raw):
             # 中文直接转写显示，不经过翻译缓存
-            self.sub.set_stream_text(raw)
+            self.sub.set_stream_text("\n".join(parts))
         else:
-            # 外语只显示已经有译文的句子。没翻译完的句子不能拿原文顶替，
-            # 否则关掉双语也会看到日文漏出来。
+            # 外语只显示已经有译文的单元。没翻译完的不能拿原文顶替，
+            # 否则关掉双语也会看到日文漏出来。用换行连接，保住分行边界。
             shown = [self.tr_cache[x] for x in parts if x in self.tr_cache]
-            self.sub.set_stream_text("".join(shown))
+            # 一两个字的碎片先攒着，等下一块一起出现。
+            # 分块切在逗号上时，常切出「那么」「而且」这种短块，
+            # 单独成行很突兀，还可能是错误翻译。
+            merged, pending = [], []
+            for x in shown:
+                if len(x.strip()) < 3:
+                    pending.append(x.strip())
+                else:
+                    if pending:
+                        merged.append("".join(pending) + x)
+                        pending = []
+                    else:
+                        merged.append(x)
+            if pending:
+                merged.append("".join(pending))
+            self.sub.set_stream_text("\n".join(merged))
 
         # 原文只在「开着双语」且不是中文时才喂进去
         if self.conf.get("show_source") and not mostly_chinese(raw):
@@ -1600,12 +1759,12 @@ class App:
 
                     # 识别出来不是中文，就把已完整的句子送去翻
                     if not mostly_chinese(text):
-                        parts = [x.strip() for x in re.split(r"(?<=[。！？!?])", text)
-                                 if x.strip()]
-                        for done in parts[:-1]:
+                        # 按单元（而非整句）提交翻译，长句能分块陆续出
+                        units = split_units(text)
+                        for done in units[:-1]:
                             self._translate_sentence(done)
-                        if is_end and parts:
-                            self._translate_sentence(parts[-1])
+                        if is_end and units:
+                            self._translate_sentence(units[-1])
 
                     self._render_stream()
                     if is_end:
