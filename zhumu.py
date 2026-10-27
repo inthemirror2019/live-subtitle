@@ -47,6 +47,16 @@ FONT = "Microsoft YaHei"
 
 # 语言码：界面中文名 -> ASR 提示码 / 翻译目标名
 # fun-asr-realtime 支持 30 语种 + 16 方言；es/pt/it 已实测可用（paraformer 不行）
+# 延迟徽标配色：(底色, 字色)
+LAT_THEMES = {
+    "深灰": ("#23272E", "#E6E8EB"),
+    "深蓝": ("#16202E", "#8FC6FF"),
+    "纯黑": ("#0A0A0A", "#F0F0F0"),
+    "暖灰": ("#2B2723", "#EDE4D8"),
+    "米白": ("#F2EFE8", "#242424"),
+}
+LAT_THEME_DEFAULT = "深灰"
+
 SRC_LANGS = [("auto", "自动"), ("zh", "中文"), ("en", "英语"), ("ja", "日语"),
              ("ko", "韩语"), ("ru", "俄语"), ("fr", "法语"), ("de", "德语"),
              ("es", "西班牙语"), ("pt", "葡萄牙语"), ("it", "意大利语")]
@@ -126,10 +136,15 @@ DEFAULT_CONF = {
     "idle_hide": 5.0,
     "min_show": 2.5,
     "punct_batch": True,
+    "show_latency": False,
+    "latency_theme": "深灰",
     "audio_device": "",
     "show_source": False,
     "src_lang": "auto",
     "dst_lang": "zh",
+    "asr_engine": "cloud",
+    "local_model_dir": "D:/sherpa-models/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05",
+    "local_punct_dir": "D:/sherpa-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8",
     "show_sub": True,
 }
 
@@ -372,7 +387,8 @@ class AsrStream(threading.Thread):
                         cur_begin = begin
                     elif begin != cur_begin:
                         cur_begin = begin
-                    self.on_partial(text, sent.get("sentence_end", False))
+                    self.on_partial(text, sent.get("sentence_end", False),
+                                    sent.get("begin_time"))
 
             await asyncio.gather(sender(), receiver())
             try:
@@ -430,6 +446,158 @@ def list_loopback_devices():
 
 
 # ============================ 音频引擎 ============================
+class LocalAsr(threading.Thread):
+    """本地流式识别（sherpa-onnx + Zipformer），接口与 AsrStream 对齐。
+
+    模型：sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct
+    特点：中英双语 + 原生标点；纯 CPU；首字几百毫秒。
+    """
+
+    def __init__(self, on_partial, on_final, on_error, model_dir, punct_dir=None):
+        super().__init__(daemon=True)
+        self.on_partial = on_partial
+        self.on_final = on_final
+        self.on_error = on_error
+        self.model_dir = model_dir
+        self.punct_dir = punct_dir
+        self._punct = None
+        self.running = False
+        self.q = queue.Queue(maxsize=400)
+        self._last = ""
+
+    def stop(self):
+        self.running = False
+        try:
+            self.q.put_nowait(None)
+        except Exception:
+            pass
+
+    def feed(self, pcm):
+        try:
+            self.q.put_nowait(pcm)
+        except queue.Full:
+            pass
+
+    @staticmethod
+    def _find_files(root):
+        """递归找模型四件套，优先 int8"""
+        enc = dec = joi = tok = None
+        for dirpath, _, filenames in os.walk(root):
+            for f in filenames:
+                fl = f.lower()
+                full = os.path.join(dirpath, f)
+                if fl == "tokens.txt":
+                    tok = tok or full
+                elif fl.endswith(".onnx"):
+                    for key, cur in (("encoder", enc), ("decoder", dec), ("joiner", joi)):
+                        if key in fl:
+                            if cur is None or "int8" in fl:
+                                if key == "encoder":
+                                    enc = full
+                                elif key == "decoder":
+                                    dec = full
+                                else:
+                                    joi = full
+        return enc, dec, joi, tok
+
+    def run(self):
+        try:
+            import sherpa_onnx
+        except Exception as e:
+            self.on_error("未安装 sherpa-onnx（pip install sherpa-onnx）：%s" % e)
+            return
+
+        if not self.model_dir or not os.path.isdir(self.model_dir):
+            self.on_error("本地模型目录不存在：%s" % self.model_dir)
+            return
+
+        enc, dec, joi, tok = self._find_files(self.model_dir)
+        if not (enc and dec and tok):
+            self.on_error("本地模型文件不全（需 encoder/decoder/tokens.txt）：%s"
+                          % self.model_dir)
+            return
+
+        try:
+            common = dict(
+                tokens=tok, encoder=enc, decoder=dec,
+                num_threads=1,                    # 小模型单线程最快（多线程反而慢）
+                sample_rate=16000, feature_dim=80,
+                decoding_method="greedy_search",
+                enable_endpoint_detection=True,   # 端点检测：静音自动断句
+                rule1_min_trailing_silence=2.4,
+                rule2_min_trailing_silence=1.2,
+                rule3_min_utterance_length=300,
+            )
+            if joi:
+                # Zipformer Transducer（有 joiner）
+                rec = sherpa_onnx.OnlineRecognizer.from_transducer(joiner=joi, **common)
+            else:
+                # Paraformer（CTC，无 joiner）—— 中英流式首选，无重复/垃圾 token
+                rec = sherpa_onnx.OnlineRecognizer.from_paraformer(**common)
+            stream = rec.create_stream()
+        except Exception as e:
+            self.on_error("本地识别初始化失败：%s" % e)
+            return
+
+        # 标点模型（可选，缺失则不加标点）
+        if self.punct_dir and os.path.isdir(self.punct_dir):
+            try:
+                pm = None
+                for f in os.listdir(self.punct_dir):
+                    if f.endswith(".onnx"):
+                        if pm is None or "int8" in f.lower():
+                            pm = os.path.join(self.punct_dir, f)
+                if pm:
+                    self._punct = sherpa_onnx.OfflinePunctuation(
+                        sherpa_onnx.OfflinePunctuationConfig(
+                            model=sherpa_onnx.OfflinePunctuationModelConfig(
+                                ct_transformer=pm, num_threads=1)))
+                    log("标点模型已加载")
+            except Exception as e:
+                log("标点模型加载失败（将不加标点）：%s" % e)
+
+        def with_punct(t):
+            if not t:
+                return t
+            # 模型自带标点（如 X-ASR）时不再重复加
+            if re.search(r"[。！？!?，、,;；]", t):
+                return t
+            if not self._punct:
+                return t
+            try:
+                return self._punct.add_punctuation(t)
+            except Exception:
+                return t
+
+        log("本地识别就绪：%s" % os.path.basename(self.model_dir.rstrip("\\/")))
+        self.running = True
+        while self.running:
+            try:
+                item = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            try:
+                arr = np.frombuffer(item, dtype="<i2").astype(np.float32) / 32768.0
+                stream.accept_waveform(16000, arr)
+                while rec.is_ready(stream):
+                    rec.decode_stream(stream)
+                text = (rec.get_result(stream) or "").strip()
+                if rec.is_endpoint(stream):
+                    if text:
+                        self.on_partial(with_punct(text), True, None)
+                    rec.reset(stream)
+                    self._last = ""
+                elif text and text != self._last:
+                    self._last = text
+                    self.on_partial(with_punct(text), False, None)
+            except Exception as e:
+                self.on_error("本地识别出错：%s" % e)
+                break
+        self.running = False
+
+
 class AudioEngine(threading.Thread):
     """抓系统输出，能量 VAD 切段"""
 
@@ -508,6 +676,112 @@ class AudioEngine(threading.Thread):
 
 
 # ============================ 字幕浮窗 ============================
+class LatencyBadge:
+    """延迟徽标 —— 完全独立的窗口。
+
+    刻意不与 SubtitleWindow 共享任何状态：位置、拖动、显隐、配色全自己管。
+    动字幕窗不会影响它，动它也不会影响字幕窗。
+    """
+
+    def __init__(self, master, conf):
+        self.conf = conf
+        self.text = ""
+        self._abs = list(conf["latency_abs"]) if conf.get("latency_abs") else None
+        self._drag = None
+        bg, fg = LAT_THEMES.get(conf.get("latency_theme", LAT_THEME_DEFAULT),
+                                LAT_THEMES[LAT_THEME_DEFAULT])
+        self.win = tk.Toplevel(master)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg=bg)
+        self.label = tk.Label(self.win, text="", bg=bg, fg=fg, font=(FONT, -14))
+        self.label.pack(padx=7, pady=2)
+        for ev, fn in (("<Button-1>", self._press),
+                       ("<B1-Motion>", self._motion),
+                       ("<ButtonRelease-1>", self._release)):
+            self.win.bind(ev, fn)
+            self.label.bind(ev, fn)
+        self.win.withdraw()
+
+    # ---------------- 对外接口 ----------------
+    def set_text(self, text):
+        """有内容就显示，空内容就隐藏。位置与字幕窗无关。"""
+        self.text = text or ""
+        if not self.text:
+            self.hide()
+            return
+        try:
+            self.label.config(text=self.text)
+            if not self._abs:
+                # 默认位置：屏幕右上角（不参考字幕窗位置）
+                self._abs = [self.win.winfo_screenwidth() - 130, 40]
+            self._place()
+            self.show()
+        except Exception:
+            pass
+
+    def set_theme(self, name):
+        bg, fg = LAT_THEMES.get(name, LAT_THEMES[LAT_THEME_DEFAULT])
+        try:
+            self.win.configure(bg=bg)
+            self.label.configure(bg=bg, fg=fg)
+        except Exception:
+            pass
+
+    def show(self):
+        try:
+            self.win.deiconify()
+            self.win.lift()
+        except Exception:
+            pass
+
+    def hide(self):
+        try:
+            self.win.withdraw()
+        except Exception:
+            pass
+
+    # ---------------- 内部 ----------------
+    def _place(self):
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        x = max(0, min(sw - 60, int(self._abs[0])))
+        y = max(0, min(sh - 30, int(self._abs[1])))
+        self._abs = [x, y]
+        self.win.geometry("+%d+%d" % (x, y))
+
+    def _press(self, e):
+        # 捕获鼠标，否则鼠标移出小窗后拖动会被其他窗口接管
+        try:
+            self.win.grab_set()
+        except Exception:
+            pass
+        self._drag = (e.x_root, e.y_root, self.win.winfo_x(), self.win.winfo_y())
+        return "break"
+
+    def _motion(self, e):
+        if not self._drag:
+            return "break"
+        x0, y0, wx, wy = self._drag
+        self._abs = [wx + (e.x_root - x0), wy + (e.y_root - y0)]
+        try:
+            self.win.geometry("+%d+%d" % tuple(self._abs))
+        except Exception:
+            pass
+        return "break"
+
+    def _release(self, e):
+        if self._drag:
+            self.conf["latency_abs"] = list(self._abs or [])
+            save_conf(self.conf)
+        self._drag = None
+        try:
+            self.win.grab_release()
+        except Exception:
+            pass
+        return "break"
+
+
 class SubtitleWindow:
     HANDLE = 24
 
@@ -559,6 +833,8 @@ class SubtitleWindow:
         self.redraw()
         # 必须等窗口真正映射后再设分层属性，否则不生效
         self.win.after(120, self.apply_style)
+        # 【已撤】定时 SetWindowPos 强制置顶会让透明窗口反复重合成、导致闪烁，
+        # 且对腾讯视频无效。待办见需求清单 F27。
         self.win.after(800, self._check_idle)
 
     # ---------- 外观 ----------
@@ -626,6 +902,27 @@ class SubtitleWindow:
         if self.auto_width:
             self._schedule_fit()
 
+    def _force_topmost(self):
+        """【当前未启用】用 Win32 SetWindowPos 强制置顶。
+
+        注意：定时调用会让透明窗口反复重合成 → 画面闪烁，且对腾讯视频无效，
+        所以先停用。需要时手动调用一次即可。
+
+        Tk 的 -topmost 对某些播放器（如腾讯视频）不够，
+        它会把窗口重新压到下面；定时用系统 API 再顶一次。
+        注意：播放器的「独占全屏」模式任何窗口都盖不住，需切窗口化。
+        """
+        try:
+            if sys.platform == "win32":
+                GA_ROOT, HWND_TOPMOST = 2, -1
+                SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0010
+                hwnd = ctypes.windll.user32.GetAncestor(self.win.winfo_id(), GA_ROOT)
+                if hwnd:
+                    ctypes.windll.user32.SetWindowPos(
+                        hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:
+            pass
     def move_bottom(self):
         """一键挪到屏幕底部居中，像播放器字幕那样"""
         try:
@@ -834,9 +1131,21 @@ class SubtitleWindow:
                 chunk = chunk.strip()
                 if not chunk:
                     continue
+                # 先把句末的延迟标记「（x.xs）」摘下来，
+                # 否则它会被逗号/句号切分成独立一行
+                m_tail = re.search(r"(（\d+\.\d+s）)$", chunk)
+                tail = m_tail.group(1) if m_tail else ""
+                body = chunk[:m_tail.start()].strip() if m_tail else chunk
+                if not body:
+                    if tail:
+                        segs.append(tail)
+                    continue
                 # 句末标点 + 逗号类都分段：逗号处也断开，避免堆成一大段
-                segs.extend([x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", chunk)
-                             if x.strip()])
+                sub = [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", body)
+                       if x.strip()]
+                if sub and tail:
+                    sub[-1] = sub[-1] + tail      # 标记贴回本句最后一段
+                segs.extend(sub)
             return segs
 
         def refine(parts):
@@ -865,11 +1174,17 @@ class SubtitleWindow:
             MAXL = 20
             out = []
             for pp in merged:
+                # 末尾的延迟标记（如「（2.0s）」）不参与断行，始终跟在同一句后面
+                m_tail = re.search(r"(（\d+\.\d+s）)$", pp)
+                tail = ""
+                if m_tail:
+                    tail = m_tail.group(1)
+                    pp = pp[:m_tail.start()]
                 while len(pp) > MAXL:
                     out.append(pp[:MAXL])
                     pp = pp[MAXL:]
-                if pp:
-                    out.append(pp)
+                if pp or tail:
+                    out.append(pp + tail)
             return out
 
         prev_text = getattr(self, "_prev_text", "") or ""
@@ -1029,6 +1344,8 @@ class SubtitleWindow:
         self.conf["show_sub"] = True
         save_conf(self.conf)
         self.win.after(120, self.apply_style)
+        # 【已撤】定时 SetWindowPos 强制置顶会让透明窗口反复重合成、导致闪烁，
+        # 且对腾讯视频无效。待办见需求清单 F27。
         self.win.after(800, self._check_idle)
 
     def hide(self):
@@ -1126,6 +1443,7 @@ class SubtitleWindow:
         n = len(entries)
 
         y = base
+        active_item = None
         for i in range(n - 1, -1, -1):
             txt, is_src = entries[i]
             f_size = fs_src if is_src else fs
@@ -1136,10 +1454,15 @@ class SubtitleWindow:
                 c.create_text(cx + dx, y + dy, text=txt, fill=p["outline"],
                               font=(FONT, -f_size), width=wrap,
                               justify="left", anchor="sw")
-            c.create_text(cx, y, text=txt, fill=color,
-                          font=(FONT, -f_size), width=wrap,
-                          justify="left", anchor="sw")
+            _it = c.create_text(cx, y, text=txt, fill=color,
+                                font=(FONT, -f_size), width=wrap,
+                                justify="left", anchor="sw")
+            if i == n - 1:
+                active_item = _it
             y -= heights[i] + gap
+
+        # 延迟徽标是独立窗口，这里不画
+
 
         # 调整模式提示
         if self.adjusting:
@@ -1172,10 +1495,10 @@ ACC = "#3DDC97"
 
 def card(parent, title):
     f = tk.Frame(parent, bg=CARD, highlightbackground=LINE, highlightthickness=1)
-    f.pack(fill="x", padx=16, pady=(0, 7))
+    f.pack(fill="x", padx=14, pady=(0, 5))
     if title:
         tk.Label(f, text=title, bg=CARD, fg=TXT3, font=(FONT, 9)).pack(
-            anchor="w", padx=12, pady=(8, 0))
+            anchor="w", padx=12, pady=(6, 0))
     return f
 
 
@@ -1193,15 +1516,15 @@ class Settings:
 
         # ---- 顶部 ----
         head = tk.Frame(root, bg=BG)
-        head.pack(fill="x", padx=16, pady=(14, 8))
-        tk.Label(head, text="字幕助手", bg=BG, fg=TXT, font=(FONT, 18, "bold")).pack(anchor="w")
+        head.pack(fill="x", padx=14, pady=(10, 6))
+        tk.Label(head, text="字幕助手", bg=BG, fg=TXT, font=(FONT, 16, "bold")).pack(anchor="w")
         tk.Label(head, text="把听到的，变成看得懂的", bg=BG, fg=TXT3,
                  font=(FONT, 9)).pack(anchor="w", pady=(2, 0))
 
         # ---- Key 卡片 ----
         c1 = card(root, "模型密钥")
         row = tk.Frame(c1, bg=CARD)
-        row.pack(fill="x", padx=12, pady=(6, 4))
+        row.pack(fill="x", padx=12, pady=(4, 3))
 
         self.key_names = [k.get("name", "默认") for k in conf["keys"]] or ["（未配置）"]
         self.key_menu_var = tk.StringVar(value=self.key_names[min(conf["active"], len(self.key_names) - 1)])
@@ -1227,7 +1550,7 @@ class Settings:
         e.pack(fill="x", padx=12, pady=(0, 3), ipady=6)
 
         self.key_status = tk.Label(c1, text="", bg=CARD, fg=ACC, font=(FONT, 9), anchor="w")
-        self.key_status.pack(fill="x", padx=12, pady=(0, 9))
+        self.key_status.pack(fill="x", padx=12, pady=(0, 7))
 
         self._key_job = None
         self.key_var.trace_add("write", lambda *a: self._on_key_change())
@@ -1236,7 +1559,7 @@ class Settings:
         # ---- 字幕卡片 ----
         c2 = card(root, "字幕")
         r2 = tk.Frame(c2, bg=CARD)
-        r2.pack(fill="x", padx=12, pady=(6, 6))
+        r2.pack(fill="x", padx=12, pady=(5, 4))
         tk.Label(r2, text="显示", bg=CARD, fg=TXT2, font=(FONT, 10), width=6,
                  anchor="w").pack(side="left")
         self.btn_show = tk.Button(r2, text="", command=self._toggle_sub, bg=CARD2, fg=TXT2,
@@ -1246,7 +1569,7 @@ class Settings:
         self._refresh_sub_btn()
 
         r3 = tk.Frame(c2, bg=CARD)
-        r3.pack(fill="x", padx=12, pady=(0, 6))
+        r3.pack(fill="x", padx=12, pady=(0, 4))
         tk.Label(r3, text="背景", bg=CARD, fg=TXT2, font=(FONT, 10), width=6,
                  anchor="w").pack(side="left")
         self.bg_var = tk.StringVar(value=conf.get("bg_mode", "transparent"))
@@ -1272,20 +1595,82 @@ class Settings:
         self.alpha_scale.pack(side="left", fill="x", expand=True)
         self._refresh_bg_state()
 
+        # ---- 倍速（下拉，省一行）----
         r4 = tk.Frame(c2, bg=CARD)
-        r4.pack(fill="x", padx=12, pady=(0, 9))
+        r4.pack(fill="x", padx=12, pady=(0, 4))
         tk.Label(r4, text="倍速", bg=CARD, fg=TXT2, font=(FONT, 10), width=6,
                  anchor="w").pack(side="left")
-        self.rate_var = tk.IntVar(value=int(conf.get("rate", 1) * 10))
-        for v, label in [(10, "1.0x 完整"), (15, "1.5x 精简"), (20, "2.0x 压缩")]:
-            tk.Radiobutton(r4, text=label, variable=self.rate_var, value=v,
-                           command=self._on_rate, bg=CARD, fg=TXT2, selectcolor=CARD2,
-                           activebackground=CARD, activeforeground=TXT, font=(FONT, 10),
-                           bd=0, highlightthickness=0).pack(side="left", padx=(0, 12))
+        _RATE = {"1.0x 完整": 10, "1.5x 精简": 15, "2.0x 压缩": 20}
+        _cur_rate = {v: k for k, v in _RATE.items()}.get(
+            int(conf.get("rate", 1) * 10), "1.0x 完整")
+        self.rate_var = tk.IntVar(value=_RATE[_cur_rate])
+        self.rate_name = tk.StringVar(value=_cur_rate)
+        _rm = tk.OptionMenu(r4, self.rate_name, *_RATE.keys(), command=self._on_rate_name)
+        _rm.config(bg=CARD2, fg=TXT2, activebackground=CARD2, activeforeground=TXT,
+                   relief="flat", highlightthickness=0, font=(FONT, 9), anchor="w")
+        _rm["menu"].config(bg=CARD2, fg=TXT2, activebackground=LINE,
+                           activeforeground=TXT, font=(FONT, 9), bd=0)
+        _rm.pack(side="left")
 
         # ---- 语言 ----
         r5 = tk.Frame(c2, bg=CARD)
-        r5.pack(fill="x", padx=12, pady=(0, 6))
+        r5.pack(fill="x", padx=12, pady=(0, 4))
+
+        # ---- 引擎 + 本地模型（合并一行，省空间）----
+        r_eng = tk.Frame(c2, bg=CARD)
+        r_eng.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(r_eng, text="引擎", bg=CARD, fg=TXT2, font=(FONT, 10), width=6,
+                 anchor="w").pack(side="left")
+        self.engine_var = tk.StringVar(value=conf.get("asr_engine", "cloud"))
+        for _val, _label in [("cloud", "在线"), ("local", "本地")]:
+            tk.Radiobutton(r_eng, text=_label, variable=self.engine_var, value=_val,
+                           command=self._on_engine, bg=CARD, fg=TXT2,
+                           selectcolor=CARD2, activebackground=CARD,
+                           activeforeground=TXT, font=(FONT, 10), bd=0,
+                           highlightthickness=0).pack(side="left", padx=(0, 8))
+
+        # 本地模型：显示短名，避免长名把窗口撑宽
+        _base = os.path.dirname((conf.get("local_model_dir") or "D:/sherpa-models").rstrip("/"))
+        _full = []
+        try:
+            for _d in sorted(os.listdir(_base)):
+                _p = os.path.join(_base, _d)
+                if os.path.isdir(_p) and os.path.exists(os.path.join(_p, "tokens.txt")):
+                    _full.append(_d)
+        except Exception:
+            pass
+        _cur_full = os.path.basename((conf.get("local_model_dir") or "").rstrip("/")) or ""
+        if _cur_full and _cur_full not in _full:
+            _full = [_cur_full] + _full
+        if not _full:
+            _full = ["（未发现模型）"]
+
+        def _short(n):
+            low = n.lower()
+            if "paraformer" in low:
+                return "Paraformer"
+            if "x-asr" in low:
+                c = ("160" if "160ms" in low else "960" if "960ms" in low
+                     else "1920" if "1920ms" in low else "480")
+                return "X-ASR %s %s" % (c, "int8" if "int8" in low else "fp32")
+            return n[:16]
+
+        self._model_map = {}
+        _labels = []
+        for _f in _full:
+            _s = _short(_f)
+            self._model_map[_s] = _f
+            _labels.append(_s)
+        _cur_label = _short(_cur_full) if _cur_full else _labels[0]
+        self.local_model_var = tk.StringVar(value=_cur_label)
+        _ml = tk.OptionMenu(r_eng, self.local_model_var, *_labels,
+                            command=self._on_local_model)
+        _ml.config(bg=CARD2, fg=TXT2, activebackground=CARD2, activeforeground=TXT,
+                   relief="flat", highlightthickness=0, font=(FONT, 9), anchor="w")
+        _ml["menu"].config(bg=CARD2, fg=TXT2, activebackground=LINE,
+                           activeforeground=TXT, font=(FONT, 9), bd=0)
+        _ml.pack(side="left", padx=(4, 0))
+
         tk.Label(r5, text="语言", bg=CARD, fg=TXT2, font=(FONT, 10), width=6,
                  anchor="w").pack(side="left")
 
@@ -1311,12 +1696,10 @@ class Settings:
                           activeforeground=TXT, font=(FONT, 10), bd=0)
         m2.pack(side="left")
 
-        tk.Label(c2, text="识别支持 30 语种：中 英 日 韩 俄 法 德 西 葡 意 等",
-                 bg=CARD, fg=TXT3, font=(FONT, 8), anchor="w").pack(
-            fill="x", padx=12, pady=(0, 4))
+
 
         r6 = tk.Frame(c2, bg=CARD)
-        r6.pack(fill="x", padx=12, pady=(0, 10))
+        r6.pack(fill="x", padx=12, pady=(0, 4))
         tk.Label(r6, text="", bg=CARD, width=6).pack(side="left")
         self.show_src_var = tk.BooleanVar(value=conf.get("show_source", False))
         tk.Checkbutton(r6, text="显示原文（双语字幕）", variable=self.show_src_var,
@@ -1326,7 +1709,7 @@ class Settings:
                        highlightthickness=0).pack(side="left")
 
         r6b = tk.Frame(c2, bg=CARD)
-        r6b.pack(fill="x", padx=12, pady=(0, 10))
+        r6b.pack(fill="x", padx=12, pady=(0, 4))
         tk.Label(r6b, text="", bg=CARD, width=6).pack(side="left")
         self.punct_batch_var = tk.BooleanVar(value=conf.get("punct_batch", True))
         tk.Checkbutton(r6b, text="按断句整段显示（关=打字机）", variable=self.punct_batch_var,
@@ -1335,10 +1718,31 @@ class Settings:
                        activeforeground=TXT, font=(FONT, 10), bd=0,
                        highlightthickness=0).pack(side="left")
 
+        r6c = tk.Frame(c2, bg=CARD)
+        r6c.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(r6c, text="", bg=CARD, width=6).pack(side="left")
+        self.show_latency_var = tk.BooleanVar(value=conf.get("show_latency", False))
+        tk.Checkbutton(r6c, text="显示延迟", variable=self.show_latency_var,
+                       command=self._on_show_latency, bg=CARD, fg=TXT2,
+                       selectcolor=CARD2, activebackground=CARD,
+                       activeforeground=TXT, font=(FONT, 10), bd=0,
+                       highlightthickness=0).pack(side="left")
+
+        # 延迟底色主题（跟勾选框同一行，不额外占高度）
+        self.lat_theme_var = tk.StringVar(
+            value=conf.get("latency_theme", LAT_THEME_DEFAULT))
+        _lt = tk.OptionMenu(r6c, self.lat_theme_var, *LAT_THEMES.keys(),
+                            command=self._on_lat_theme)
+        _lt.config(bg=CARD2, fg=TXT2, activebackground=CARD2, activeforeground=TXT,
+                   relief="flat", highlightthickness=0, font=(FONT, 9), anchor="w")
+        _lt["menu"].config(bg=CARD2, fg=TXT2, activebackground=LINE,
+                           activeforeground=TXT, font=(FONT, 9), bd=0)
+        _lt.pack(side="left", padx=(6, 0))
+
         # ---- 状态卡片 ----
         c3 = card(root, "状态")
         rdev = tk.Frame(c3, bg=CARD)
-        rdev.pack(fill="x", padx=12, pady=(6, 3))
+        rdev.pack(fill="x", padx=12, pady=(4, 2))
         tk.Label(rdev, text="音频源", bg=CARD, fg=TXT2, font=(FONT, 10), width=6,
                  anchor="w").pack(side="left")
         devs = list_loopback_devices()
@@ -1361,17 +1765,17 @@ class Settings:
         self.dev_label.pack(fill="x", padx=12, pady=(0, 1))
         self.status = tk.Label(c3, text="", bg=CARD, fg="#F0A93B", font=(FONT, 9),
                                anchor="w", justify="left", wraplength=440)
-        self.status.pack(fill="x", padx=12, pady=(0, 10))
+        self.status.pack(fill="x", padx=12, pady=(0, 8))
 
         # ---- 主按钮 ----
         self.btn = tk.Button(root, text="开始听", command=self._toggle,
                              bg=ACC, fg="#04160D", relief="flat",
                              font=(FONT, 13, "bold"), cursor="hand2",
                              activebackground="#54EDAA")
-        self.btn.pack(fill="x", padx=16, pady=(2, 6), ipady=9)
+        self.btn.pack(fill="x", padx=14, pady=(2, 4), ipady=8)
 
         tk.Label(root, text="点开始后可以关掉这个窗口，字幕会留在屏幕上。双击字幕条可隐藏。",
-                 bg=BG, fg=TXT3, font=(FONT, 8)).pack(anchor="w", padx=16)
+                 bg=BG, fg=TXT3, font=(FONT, 8)).pack(anchor="w", padx=14)
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1501,7 +1905,9 @@ class Settings:
         try:
             self.root.update_idletasks()
             need = self.root.winfo_reqheight() + 8
-            self.root.geometry("500x%d" % min(max(need, 420), 1000))
+            _sh = self.root.winfo_screenheight()
+            _maxh = int(_sh * 0.92)          # 不超出屏幕（1080p 下约 994）
+            self.root.geometry("500x%d" % min(max(need, 420), _maxh))
         except Exception as e:
             log("fit height failed: %s" % e)
 
@@ -1515,6 +1921,43 @@ class Settings:
     def _on_dst_lang(self, name):
         code = dict((n, c) for c, n in DST_LANGS).get(name, "zh")
         self.conf["dst_lang"] = code
+        save_conf(self.conf)
+
+    def _on_local_model(self, name):
+        if name.startswith("（"):
+            return
+        full = getattr(self, "_model_map", {}).get(name, name)
+        _base = os.path.dirname((self.conf.get("local_model_dir") or "D:/sherpa-models").rstrip("/"))
+        self.conf["local_model_dir"] = _base + "/" + full
+        save_conf(self.conf)
+        if self.app.running:
+            self.status.config(text="本地模型切换需停止后重新开始")
+
+    def _on_engine(self):
+        v = self.engine_var.get()
+        self.conf["asr_engine"] = v
+        save_conf(self.conf)
+        if v == "local":
+            md = self.conf.get("local_model_dir", "")
+            if not os.path.isdir(md):
+                self.status.config(text="本地模型未下载：%s" % md, fg="#e0a030")
+            elif self.app.running:
+                self.status.config(text="引擎切换需停止后重新开始")
+        else:
+            if self.app.running:
+                self.status.config(text="引擎切换需停止后重新开始")
+
+    def _on_lat_theme(self, name):
+        self.conf["latency_theme"] = name
+        save_conf(self.conf)
+        try:
+            if getattr(self.app, "sub", None):
+                self.app.badge.set_theme(name)
+        except Exception:
+            pass
+
+    def _on_show_latency(self):
+        self.conf["show_latency"] = bool(self.show_latency_var.get())
         save_conf(self.conf)
 
     def _on_punct_batch(self):
@@ -1547,6 +1990,11 @@ class Settings:
         save_conf(self.conf)
         self._refresh_bg_state()
         self.app.sub.apply_style()
+
+    def _on_rate_name(self, name):
+        v = {"1.0x 完整": 10, "1.5x 精简": 15, "2.0x 压缩": 20}.get(name, 10)
+        self.rate_var.set(v)
+        self._on_rate()
 
     def _on_rate(self):
         self.conf["rate"] = self.rate_var.get() / 10
@@ -1611,13 +2059,23 @@ class App:
         self._pending = ""
         self._pending_since = None
         self.tr_cache = {}        # 原文 -> 译文
+        self.tr_ms = {}           # 原文 -> 翻译耗时(ms)
+        self._fed_sec = 0.0       # 已喂入音频累计秒数（在线时用于算「从发声到上屏」）
+        self._last_begin_ms = None  # 当前句在音频里的起始毫秒（云端 fun-asr 提供）
+        self.unit_seen = {}       # 单元 -> 首次识别出字的时间（端到端起点）
+        self.unit_e2e = {}        # 单元 -> 端到端耗时（同一句共用）
+        self._sent_e2e = None     # 当前句的端到端耗时（一句只算一次）
+        self._sent_key = None     # 当前句标识（begin_ms 或句序号）
+        self._sent_seq = 0        # 句子序号（本地引擎用）
         self.tr_busy = set()      # 正在翻译、还没回来的句子
         self._last_raw = ""       # 最近一次原始累积文本
 
         self.sub = SubtitleWindow(self.root, self.conf,
                                   on_settings=self.open_settings,
                                   on_hide=self.hide_sub)
-        log("subtitle window built")
+        # 延迟徽标是独立窗口（自己管位置/拖动/显隐），与字幕窗互不影响
+        self.badge = LatencyBadge(self.root, self.conf)
+        log("subtitle window + latency badge built")
         self.settings = Settings(self.root, self.conf, self)
         log("settings built")
 
@@ -1641,8 +2099,17 @@ class App:
             return False, "没有可用的 key"
         active_key_holder["k"] = active_key(self.conf)
         _sh = self.conf.get("src_lang", "auto")
-        self.stream = AsrStream(self.on_partial, self.on_final, self.on_stream_error,
-                                lang_hint=(None if _sh == "auto" else _sh))
+        if self.conf.get("asr_engine", "cloud") == "local":
+            # 本地引擎：sherpa-onnx + 中英 Zipformer（带标点）
+            self.stream = LocalAsr(
+                self.on_partial, self.on_final, self.on_stream_error,
+                self.conf.get("local_model_dir", ""),
+                punct_dir=self.conf.get("local_punct_dir", ""))
+            log("识别引擎：本地（sherpa-onnx）")
+        else:
+            self.stream = AsrStream(self.on_partial, self.on_final, self.on_stream_error,
+                                    lang_hint=(None if _sh == "auto" else _sh))
+            log("识别引擎：在线（百炼）")
         self.stream.start()
         time.sleep(0.4)
 
@@ -1656,8 +2123,7 @@ class App:
         except Exception as e:
             return False, "启动音频失败：%s" % e
 
-        self.worker = threading.Thread(target=self.work_loop, daemon=True)
-        self.worker.start()
+        # work_loop 是旧的 VAD 分段识别（work_q 从未被填充），已废弃不再启动
 
         self.sub.show()
         self.sub.set_state("live")
@@ -1678,6 +2144,11 @@ class App:
         self.sub.clear_queue()
         self.sub.dst_text = "已停止"
         self.sub.redraw()
+        # 停止时收起延迟徽标（它自己管显隐，但程序停了不该残留）
+        try:
+            self.badge.set_text("")
+        except Exception:
+            pass
 
     def hide_sub(self):
         self.sub.hide()
@@ -1703,12 +2174,17 @@ class App:
         self.ui_q.put(("level", db, None))
 
     def on_audio_chunk(self, mono):
+        try:
+            self._fed_sec += len(mono) / float(SR)
+        except Exception:
+            pass
         if self.stream:
             pcm = (np.clip(mono, -1, 1) * 32767).astype("<i2").tobytes()
             self.stream.feed(pcm)
 
-    def on_partial(self, text, is_end):
-        self.ui_q.put(("partial", text, is_end))
+    def on_partial(self, text, is_end, begin_ms=None):
+        self._last_begin_ms = begin_ms
+        self.ui_q.put(("partial", text, is_end, begin_ms))
 
     def on_final(self, text):
         self.ui_q.put(("final", text))
@@ -1723,21 +2199,42 @@ class App:
         self.tr_busy.add(sent)
 
         def work():
+            t0 = time.perf_counter()
             try:
                 zh = do_translate(sent, active_key(self.conf), self.conf.get("rate", 1),
                                   self.conf.get("dst_lang", "zh"))
+                ms = (time.perf_counter() - t0) * 1000
                 if zh and zh != sent:
-                    self.ui_q.put(("trans", sent, zh))
+                    self.ui_q.put(("trans", sent, zh, ms))
                 else:
                     # 翻译没成功也要有东西显示，退回原文
-                    self.ui_q.put(("trans", sent, sent))
+                    self.ui_q.put(("trans", sent, sent, ms))
             except Exception as e:
+                ms = (time.perf_counter() - t0) * 1000
                 log("翻译失败：%s" % str(e)[:80])
-                self.ui_q.put(("trans", sent, sent))
+                self.ui_q.put(("trans", sent, sent, ms))
             finally:
                 self.ui_q.put(("trans_done", sent))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _cur_e2e(self, now):
+        """当前句的端到端耗时。一句只算一次，避免随识别增长反复变化（会闪烁）。"""
+        # 句子标识：在线用 begin_ms，本地用句序号
+        key = ("b", self._last_begin_ms) if self._last_begin_ms is not None \
+              else ("s", self._sent_seq)
+        if key != self._sent_key:
+            self._sent_key = key
+            self._sent_e2e = None
+        if self._sent_e2e is None:
+            if self._last_begin_ms is not None and self._fed_sec > 0:
+                # 在线：真正的「从发声到上屏」
+                self._sent_e2e = max(0.0, self._fed_sec - self._last_begin_ms / 1000.0)
+            else:
+                # 本地：从当前句首个单元首次出字算
+                vals = [v for k, v in self.unit_seen.items()]
+                self._sent_e2e = max(0.0, now - min(vals)) if vals else 0.0
+        return self._sent_e2e
 
     def _render_stream(self):
         """把最近一次识别文本按句替换成中文后再交给字幕窗"""
@@ -1747,32 +2244,45 @@ class App:
         parts = split_units(raw)
         if not parts:
             return
+
+        show_ms = bool(self.conf.get("show_latency", False))
+        now = time.time()
+        # 记录每个单元「首次识别出字」的时刻（端到端起点），只保留当前句的
+        for u in parts:
+            if u not in self.unit_seen:
+                self.unit_seen[u] = now
+        self.unit_seen = {k: v for k, v in self.unit_seen.items() if k in parts}
+        self.unit_e2e = {k: v for k, v in self.unit_e2e.items() if k in parts}
+
         if mostly_chinese(raw):
             # 中文直接转写显示，不经过翻译缓存
+            self.badge.set_text("%.1fs" % self._cur_e2e(now) if show_ms else "")
             self.sub.set_stream_text("\n".join(parts))
-        else:
-            # 外语只显示已经有译文的单元。没翻译完的不能拿原文顶替，
-            # 否则关掉双语也会看到日文漏出来。用换行连接，保住分行边界。
-            shown = [self.tr_cache[x] for x in parts if x in self.tr_cache]
-            # 一两个字的碎片先攒着，等下一块一起出现。
-            # 分块切在逗号上时，常切出「那么」「而且」这种短块，
-            # 单独成行很突兀，还可能是错误翻译。
-            merged, pending = [], []
-            for x in shown:
-                if len(x.strip()) < 3:
-                    pending.append(x.strip())
-                else:
-                    if pending:
-                        merged.append("".join(pending) + x)
-                        pending = []
-                    else:
-                        merged.append(x)
-            if pending:
-                merged.append("".join(pending))
-            self.sub.set_stream_text("\n".join(merged))
+            return
 
-        # 原文只在「开着双语」且不是中文时才喂进去
-        if self.conf.get("show_source") and not mostly_chinese(raw):
+        # 外语只显示已经有译文的单元；没翻完的不能拿原文顶替
+        shown = [self.tr_cache[x] for x in parts if x in self.tr_cache]
+        # 延迟单独交给字幕窗绘制，绝不混进文本（混进去会让断行变化 → 字跳动）
+        self.badge.set_text(("%.1fs" % self._cur_e2e(now))
+                            if (show_ms and shown) else "")
+
+        # 一两个字的碎片先攒着，等下一块一起出现
+        merged, pending = [], []
+        for x in shown:
+            if len(x.strip()) < 3:
+                pending.append(x.strip())
+            else:
+                if pending:
+                    merged.append("".join(pending) + x)
+                    pending = []
+                else:
+                    merged.append(x)
+        if pending:
+            merged.append("".join(pending))
+        self.sub.set_stream_text("\n".join(merged))
+
+        # 原文只在「开着双语」时才喂进去
+        if self.conf.get("show_source"):
             self.sub.set_source(parts[-1])
         else:
             self.sub.set_source("")
@@ -1819,7 +2329,9 @@ class App:
             while True:
                 msg = self.ui_q.get_nowait()
                 if msg[0] == "partial":
-                    _, text, is_end = msg
+                    _, text, is_end = msg[0:3]
+                    if len(msg) > 3:
+                        self._last_begin_ms = msg[3]
                     self._last_raw = text
 
                     # 识别出来不是中文，就把已完整的句子送去翻
@@ -1835,10 +2347,13 @@ class App:
                     if is_end:
                         log("ASR [end] %s" % text[-60:])
                         self.sub.finalize()
+                        self._sent_seq += 1      # 下一句重新计时
+                        self._sent_key = None
 
                 elif msg[0] == "trans":
-                    _, src, zh = msg
+                    _, src, zh, ms = msg
                     self.tr_cache[src] = zh
+                    self.tr_ms[src] = ms
                     self._render_stream()
 
                 elif msg[0] == "trans_done":

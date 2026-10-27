@@ -1,5 +1,10 @@
 {
-  "keys": [{"name": "默认", "key": "sk-请填入你的阿里百炼APIKey"}],
+  "keys": [
+    {
+      "name": "默认",
+      "key": "sk-请填入你的阿里百炼APIKey"
+    }
+  ],
   "active": 0,
   "rate": 1,
   "preset": "outline",
@@ -16,5 +21,11 @@
   "show_source": false,
   "src_lang": "auto",
   "dst_lang": "zh",
-  "idle_hide": 5.0
+  "idle_hide": 5.0,
+  "asr_engine": "cloud",
+  "local_model_dir": "D:/sherpa-models/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05",
+  "local_punct_dir": "D:/sherpa-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8",
+  "show_latency": false,
+  "latency_theme": "深灰",
+  "punct_batch": true
 }
