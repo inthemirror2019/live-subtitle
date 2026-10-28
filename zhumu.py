@@ -57,6 +57,11 @@ LAT_THEMES = {
 }
 LAT_THEME_DEFAULT = "深灰"
 
+# 本地 ASR 的首字延迟（秒）：从"说出口"到"识别出字"要多久。
+# X-ASR 是 480ms chunk 的流式模型 —— 必须攒够一块音频才解码，
+# 实测首字出现在音频 0.65s 处（不是纯推理的 150ms）。
+LOCAL_ASR_LEAD = 0.65
+
 SRC_LANGS = [("auto", "自动"), ("zh", "中文"), ("en", "英语"), ("ja", "日语"),
              ("ko", "韩语"), ("ru", "俄语"), ("fr", "法语"), ("de", "德语"),
              ("es", "西班牙语"), ("pt", "葡萄牙语"), ("it", "意大利语")]
@@ -403,7 +408,7 @@ class AsrStream(threading.Thread):
 active_key_holder = {"k": ""}
 
 
-def split_units(text):
+def split_units(text, merge=True):
     """把长句切成「翻译单元」。
 
     切分优先级（高→低）：
@@ -418,18 +423,23 @@ def split_units(text):
     # 1) 先按语音停顿切
     for seg in [x.strip() for x in text.split("\u0001") if x.strip()]:
         # 2) 再按标点切 —— 标点处必切（优先级高于字数兜底）
-        for p in [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", seg) if x.strip()]:
-            # 3) 只有「没有标点结尾的长段」才按 12 字兜底
-            while len(p) > 12 and not p.rstrip().endswith(tuple("。！？!?，、,;；")):
-                out.append(p[:12])
-                p = p[12:]
+        for p in [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；.])", seg) if x.strip()]:
+            # 3) 没有标点结尾的长段才按字数兜底。
+            #    中文 12 字；英文按字符算 12 太短（约 2 个词），放宽到 40 字符
+            _lim = 12 if re.search(r"[\u4e00-\u9fff]", p) else 40
+            while len(p) > _lim and not p.rstrip().endswith(tuple("。！？!?，、,;；.")):
+                out.append(p[:_lim])
+                p = p[_lim:]
             if p:
                 out.append(p)
+    if not merge:
+        return out      # 延迟计算用：不做短碎片合并，行边界更真实
+
     # 过短块合并：<4 字且不以标点结尾的碎片才合并（标点结尾的是完整短句）
     merged = []
     for u in out:
         prev_ok = (merged and len(merged[-1]) < 4
-                   and not merged[-1].rstrip().endswith(tuple("。！？!?，、,;；")))
+                   and not merged[-1].rstrip().endswith(tuple("。！？!?，、,;；.")))
         if prev_ok:
             merged[-1] += u
         else:
@@ -560,7 +570,7 @@ class LocalAsr(threading.Thread):
             if not t:
                 return t
             # 模型自带标点（如 X-ASR）时不再重复加
-            if re.search(r"[。！？!?，、,;；]", t):
+            if re.search(r"[。！？!?，、,;；.]", t):
                 return t
             if not self._punct:
                 return t
@@ -688,6 +698,8 @@ class LatencyBadge:
         self.text = ""
         self._abs = list(conf["latency_abs"]) if conf.get("latency_abs") else None
         self._drag = None
+        self._hide_job = None                              # 空闲自动隐藏的定时器
+        self._idle = float(conf.get("idle_hide", 5.0))     # 跟字幕用同一个空闲时长
         bg, fg = LAT_THEMES.get(conf.get("latency_theme", LAT_THEME_DEFAULT),
                                 LAT_THEMES[LAT_THEME_DEFAULT])
         self.win = tk.Toplevel(master)
@@ -717,6 +729,7 @@ class LatencyBadge:
                 self._abs = [self.win.winfo_screenwidth() - 130, 40]
             self._place()
             self.show()
+            self._reset_timer()      # 有新内容就重新计时，空闲到点自动收起
         except Exception:
             pass
 
@@ -736,6 +749,30 @@ class LatencyBadge:
             pass
 
     def hide(self):
+        self._cancel_timer()
+        try:
+            self.win.withdraw()
+        except Exception:
+            pass
+
+    def _reset_timer(self):
+        self._cancel_timer()
+        try:
+            self._hide_job = self.win.after(int(self._idle * 1000), self._auto_hide)
+        except Exception:
+            self._hide_job = None
+
+    def _cancel_timer(self):
+        if self._hide_job:
+            try:
+                self.win.after_cancel(self._hide_job)
+            except Exception:
+                pass
+            self._hide_job = None
+
+    def _auto_hide(self):
+        """空闲到点：像字幕一样自动收起（没有新音频就不该一直挂着）"""
+        self._hide_job = None
         try:
             self.win.withdraw()
         except Exception:
@@ -1141,7 +1178,7 @@ class SubtitleWindow:
                         segs.append(tail)
                     continue
                 # 句末标点 + 逗号类都分段：逗号处也断开，避免堆成一大段
-                sub = [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", body)
+                sub = [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；.])", body)
                        if x.strip()]
                 if sub and tail:
                     sub[-1] = sub[-1] + tail      # 标记贴回本句最后一段
@@ -1151,7 +1188,7 @@ class SubtitleWindow:
         def refine(parts):
             # 纯标点的片段直接丢掉（如单独一个「。」「，」），它不是内容
             parts = [x for x in parts
-                     if re.sub(r"[。！？!?，、,;；\s]", "", x)]
+                     if re.sub(r"[。！？!?，、,;；.\s]", "", x)]
             # 一两个字的碎片不单独成行，攒着合并到下一行
             merged, pending = [], []
             for x in parts:
@@ -1159,7 +1196,7 @@ class SubtitleWindow:
                 # 一两个字但以标点结尾的是完整短句（「是。」「好，」），要显示；
                 # 没标点的短碎片（「那么」）才攒着合并到下一行。
                 # 否则短句全被吞掉，会连续跳过好几句。
-                ends_punct = bool(xs) and xs[-1] in "。！？!?，、,;；"
+                ends_punct = bool(xs) and xs[-1] in "。！？!?，、,;；."
                 if len(xs) < 3 and not ends_punct:
                     pending.append(xs)
                 else:
@@ -1202,11 +1239,11 @@ class SubtitleWindow:
             if self.conf.get("punct_batch", True):
                 # 【按断句整段显示】累积到断句点才一次性出完整片段，
                 # 不再一个字一个字蹦。可在设置里关掉（关掉=打字机模式）
-                segs = [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；])", new_txt)
+                segs = [x.strip() for x in re.split(r"(?<=[。！？!?，、,;；.])", new_txt)
                         if x.strip()]
                 complete = [x for x in segs
-                            if x and x[-1] in "。！？!?，、,;；"
-                            and re.sub(r"[。！？!?，、,;；\s]", "", x)]
+                            if x and x[-1] in "。！？!?，、,;；."
+                            and re.sub(r"[。！？!?，、,;；.\s]", "", x)]
                 if not complete:
                     # 还没到断句点 → 不显示，继续累积
                     return
@@ -1219,7 +1256,7 @@ class SubtitleWindow:
                 # 【打字机模式】新增内容实时追加
                 shown = refine(split_seg(prev_text))
                 self.lines = shown[-2:]
-                if re.sub(r"[。！？!?，、,;；\s]", "", new_txt):
+                if re.sub(r"[。！？!?，、,;；.\s]", "", new_txt):
                     self.active = new_txt
         else:
             # 新内容（换句了）—— 上一行还没看够的话先攒着，别急着顶掉
@@ -2065,6 +2102,10 @@ class App:
         self.unit_seen = {}       # 单元 -> 首次识别出字的时间（端到端起点）
         self.unit_e2e = {}        # 单元 -> 端到端耗时（同一句共用）
         self._sent_e2e = None     # 当前句的端到端耗时（一句只算一次）
+        self._sent_start = None   # 当前句「第一次识别出字」的时刻（延迟起点）
+        self._parts_n = 0         # 上一次的显示行数（变了说明换行，延迟重新计）
+        self._line_a = None       # 本行「首字上屏」延迟（该行第一次有译文时定下）
+        self._cur_head = ""       # 当前显示行的开头几字（换了就是新的一行）
         self._sent_key = None     # 当前句标识（begin_ms 或句序号）
         self._sent_seq = 0        # 句子序号（本地引擎用）
         self.tr_busy = set()      # 正在翻译、还没回来的句子
@@ -2184,7 +2225,8 @@ class App:
 
     def on_partial(self, text, is_end, begin_ms=None):
         self._last_begin_ms = begin_ms
-        self.ui_q.put(("partial", text, is_end, begin_ms))
+        # 带上识别这一刻的时间戳：poll 可能延迟处理，用 now 会算成 0
+        self.ui_q.put(("partial", text, is_end, begin_ms, time.time()))
 
     def on_final(self, text):
         self.ui_q.put(("final", text))
@@ -2219,22 +2261,18 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _cur_e2e(self, now):
-        """当前句的端到端耗时。一句只算一次，避免随识别增长反复变化（会闪烁）。"""
-        # 句子标识：在线用 begin_ms，本地用句序号
-        key = ("b", self._last_begin_ms) if self._last_begin_ms is not None \
-              else ("s", self._sent_seq)
-        if key != self._sent_key:
-            self._sent_key = key
-            self._sent_e2e = None
-        if self._sent_e2e is None:
-            if self._last_begin_ms is not None and self._fed_sec > 0:
-                # 在线：真正的「从发声到上屏」
-                self._sent_e2e = max(0.0, self._fed_sec - self._last_begin_ms / 1000.0)
-            else:
-                # 本地：从当前句首个单元首次出字算
-                vals = [v for k, v in self.unit_seen.items()]
-                self._sent_e2e = max(0.0, now - min(vals)) if vals else 0.0
-        return self._sent_e2e
+        """当前这一行的延迟：从本行首字出现 → 到现在（整行字幕逐步出全）。
+
+        **实时计算、不定死**：因为用户要的是「整行字幕都出来」的耗时，
+        这一行还在增长时数字就该跟着涨，直到这行说完（换行）才停止。
+        用音频位置算（不是墙钟）：音频实时播放，差值就是真实等待时间。
+        """
+        if self._last_begin_ms is not None and self._fed_sec > 0:
+            # 在线：fun-asr 给了句子在音频里的起始毫秒，最精确
+            return max(0.0, self._fed_sec - self._last_begin_ms / 1000.0)
+        # 本地：本行首次出字时的音频位置 + ASR 首字延迟补偿
+        start = self._sent_start if self._sent_start is not None else self._fed_sec
+        return max(0.0, self._fed_sec - start + LOCAL_ASR_LEAD)
 
     def _render_stream(self):
         """把最近一次识别文本按句替换成中文后再交给字幕窗"""
@@ -2247,7 +2285,23 @@ class App:
 
         show_ms = bool(self.conf.get("show_latency", False))
         now = time.time()
-        # 记录每个单元「首次识别出字」的时刻（端到端起点），只保留当前句的
+
+        # 延迟按「行」算：行数一变就说明换行了（新的翻译单元），重新计时。
+        # 这样不会像按整句算那样一直累加（连续说话时 is_end 根本不触发）。
+        # 换行判定：看**当前显示行**（parts[-1]）的开头是否还在延续。
+        # 不能用整段 raw —— 本地引擎连续说话时 endpoint 不触发，raw 会一直累积，
+        # 永远被当成"延续"，延迟就会累加到几十秒（实测出现过 55s）。
+        # 也不能用行数变化 —— 同一句内分块（1 块变 2 块）也会变。
+        _delay_parts = split_units(raw, merge=False)
+        _cur_line = _delay_parts[-1] if _delay_parts else ""
+        _cur_head = _cur_line[:4]
+        _new_line = bool(self._cur_head) and not _cur_line.startswith(self._cur_head)
+        if self._sent_start is None or _new_line:
+            # 第一帧，或当前行换了 → 新的一行，重新计时
+            self._sent_start = self._fed_sec
+            self._line_a = None
+        self._cur_head = _cur_head
+        # 记录每个单元「首次识别出字」的时刻，只保留当前句的
         for u in parts:
             if u not in self.unit_seen:
                 self.unit_seen[u] = now
@@ -2256,15 +2310,29 @@ class App:
 
         if mostly_chinese(raw):
             # 中文直接转写显示，不经过翻译缓存
-            self.badge.set_text("%.1fs" % self._cur_e2e(now) if show_ms else "")
+            if show_ms:
+                _b = self._cur_e2e(now)
+                if self._line_a is None:
+                    self._line_a = _b          # 中文直显：首字就是现在
+                self.badge.set_text("%.2fs / %.2fs" % (self._line_a, _b))
+            else:
+                self.badge.set_text("")
             self.sub.set_stream_text("\n".join(parts))
             return
 
         # 外语只显示已经有译文的单元；没翻完的不能拿原文顶替
         shown = [self.tr_cache[x] for x in parts if x in self.tr_cache]
         # 延迟单独交给字幕窗绘制，绝不混进文本（混进去会让断行变化 → 字跳动）
-        self.badge.set_text(("%.1fs" % self._cur_e2e(now))
-                            if (show_ms and shown) else "")
+        # 「首字上屏」在这句第一次有译文时定下（之后不再变）
+        _cur_has_tr = bool(parts) and parts[-1] in self.tr_cache
+        if show_ms and _cur_has_tr and self._line_a is None:
+            self._line_a = self._cur_e2e(now)
+
+        if show_ms and self._line_a is not None:
+            # 只要这句已经出过首字，就一直显示（本句内换单元不会让窗口闪没）
+            self.badge.set_text("%.2fs / %.2fs" % (self._line_a, self._cur_e2e(now)))
+        else:
+            self.badge.set_text("")
 
         # 一两个字的碎片先攒着，等下一块一起出现
         merged, pending = [], []
@@ -2349,6 +2417,8 @@ class App:
                         self.sub.finalize()
                         self._sent_seq += 1      # 下一句重新计时
                         self._sent_key = None
+                        self._sent_e2e = None
+                        self._sent_start = None
 
                 elif msg[0] == "trans":
                     _, src, zh, ms = msg
